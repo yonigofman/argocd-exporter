@@ -26,6 +26,8 @@ MANIFEST
 
 # Virtual Environments
 .env
+.env.*
+!.env.example
 .venv
 env/
 venv/
@@ -43,6 +45,15 @@ coverage.xml
 *.cover
 *.py,cover
 .hypothesis/
+
+# Tool Caches
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Generic
+*.log
+.python-version
 
 # Mac
 .DS_Store

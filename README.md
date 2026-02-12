@@ -48,16 +48,22 @@ The exporter is configured entirely through environment variables.
 
 ### Local Development
 
-1. Install dependencies:
+1. Install `uv` if you haven't:
 
    ```bash
-   pip install -r requirements.txt
+   curl -LsSf https://astral.sh/uv/install.sh | sh
    ```
 
-2. Set environment variables and run:
+2. Install dependencies:
+
+   ```bash
+   uv sync
+   ```
+
+3. Set environment variables and run:
    ```bash
    export ARGOCD_CONFIG='[{"server": "https://your-argocd.com", "token": "your-token"}]'
-   python exporter.py
+   uv run exporter.py
    ```
 
 ### Docker
@@ -78,8 +84,8 @@ docker run -p 8000:8000 \
 
 ## Testing
 
-The project uses `pytest` and `respx` for mock-based unit testing.
+The project uses `pytest` and `respx` for mock-based unit testing. Run tests with `uv`:
 
 ```bash
-python3 -m pytest test_exporter.py
+uv run pytest -v test_exporter.py
 ```
