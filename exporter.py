@@ -1,144 +1,115 @@
 import os
-import json
-import logging
 import asyncio
+import logging
 import httpx
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
+from pydantic import BaseModel, Field, TypeAdapter
 from prometheus_client import start_http_server, Gauge
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Metrics
-ARGOCD_APP_INFO = Gauge(
-    'argocd_app_info',
-    'Information about the ArgoCD application',
-    ['server', 'app_name', 'project', 'health_status', 'sync_status', 'namespace', 'cluster']
-)
+class ArgoServerConfig(BaseModel):
+    server: str
+    token: str
 
-ARGOCD_APP_HEALTH_STATUS = Gauge(
-    'argocd_app_health_status',
-    'Health status of the ArgoCD application (1 for Healthy, 0 otherwise)',
-    ['server', 'app_name', 'project', 'namespace', 'cluster']
-)
+class ExporterConfig(BaseModel):
+    servers: List[ArgoServerConfig]
+    port: int = Field(default=8000)
+    poll_interval: int = Field(default=30)
 
-ARGOCD_APP_SYNC_STATUS = Gauge(
-    'argocd_app_sync_status',
-    'Sync status of the ArgoCD application (1 for Synced, 0 otherwise)',
-    ['server', 'app_name', 'project', 'namespace', 'cluster']
-)
 
-ARGOCD_UP = Gauge(
-    'argocd_up',
-    'Status of the ArgoCD server connection (1 for Up, 0 for Down)',
-    ['server']
-)
+METRICS = {
+    "info": Gauge('argocd_app_info', 'App metadata', 
+                  ['server', 'app_name', 'project', 'health_status', 'sync_status', 'namespace', 'cluster']),
+    "health": Gauge('argocd_app_health_status', '1=Healthy', 
+                    ['server', 'app_name', 'project', 'namespace', 'cluster']),
+    "sync": Gauge('argocd_app_sync_status', '1=Synced', 
+                  ['server', 'app_name', 'project', 'namespace', 'cluster']),
+    "up": Gauge('argocd_up', 'ArgoCD API Reachability', ['server'])
+}
 
-async def fetch_apps(server_config: Dict[str, str]) -> Optional[Dict[str, Any]]:
-    server_url = server_config['server'].rstrip('/')
-    token = server_config['token']
-    headers = {'Authorization': f'Bearer {token}'}
-    
-    try:
-        async with httpx.AsyncClient(verify=False) as client:
-            response = await client.get(f"{server_url}/api/v1/applications", headers=headers)
-            response.raise_for_status()
-            return response.json()
-    except Exception as e:
-        logger.error(f"Failed to fetch apps from {server_url}: {e}")
-        return None
+class ArgoExporter:
+    def __init__(self, config: ExporterConfig):
+        self.config = config
+        self.client = httpx.AsyncClient(verify=False, timeout=10.0)
 
-async def collect_metrics(config: List[Dict[str, str]]) -> None:
-    for server_config in config:
-        server_url = server_config['server']
-        logger.info(f"Collecting metrics from {server_url}")
+    async def fetch_and_record(self, server_cfg: ArgoServerConfig):
+        url = f"{server_cfg.server.rstrip('/')}/api/v1/applications"
+        headers = {'Authorization': f'Bearer {server_cfg.token}'}
         
-        data = await fetch_apps(server_config)
-        
-        if data:
-            ARGOCD_UP.labels(server=server_url).set(1)
-            items = data.get('items', [])
-            
-            for app in items:
-                metadata = app.get('metadata', {})
-                status = app.get('status', {})
-                spec = app.get('spec', {})
-                
-                name = metadata.get('name', 'unknown')
-                project = spec.get('project', 'unknown')
-                namespace = metadata.get('namespace', 'unknown')
-                
-                destination = spec.get('destination', {})
-                cluster = destination.get('server') or destination.get('name') or 'unknown'
-                
-                health_status = status.get('health', {}).get('status', 'Unknown')
-                sync_status = status.get('sync', {}).get('status', 'Unknown')
-
-                # Info metric
-                ARGOCD_APP_INFO.labels(
-                    server=server_url,
-                    app_name=name,
-                    project=project,
-                    health_status=health_status,
-                    sync_status=sync_status,
-                    namespace=namespace,
-                    cluster=cluster
-                ).set(1)
-
-                # Health status metric
-                is_healthy = 1 if health_status == 'Healthy' else 0
-                ARGOCD_APP_HEALTH_STATUS.labels(
-                    server=server_url,
-                    app_name=name,
-                    project=project,
-                    namespace=namespace,
-                    cluster=cluster
-                ).set(is_healthy)
-
-                # Sync status metric
-                is_synced = 1 if sync_status == 'Synced' else 0
-                ARGOCD_APP_SYNC_STATUS.labels(
-                    server=server_url,
-                    app_name=name,
-                    project=project,
-                    namespace=namespace,
-                    cluster=cluster
-                ).set(is_synced)
-        else:
-            ARGOCD_UP.labels(server=server_url).set(0)
-
-async def main() -> None:
-    # Parse configuration
-    config_str = os.environ.get('ARGOCD_CONFIG')
-    if not config_str:
-        logger.error("ARGOCD_CONFIG environment variable is not set")
-        return
-
-    try:
-        config = json.loads(config_str)
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse ARGOCD_CONFIG: {e}")
-        return
-
-    # Helper function to get int from env or default
-    def get_env_int(key: str, default: int) -> int:
         try:
-            return int(os.environ.get(key, default))
-        except ValueError:
-            return default
+            response = await self.client.get(url, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            
+            METRICS["up"].labels(server=server_cfg.server).set(1)
+            self._process_apps(server_cfg.server, data.get('items', []))
+            
+        except Exception as e:
+            logger.error(f"Scrape failed for {server_cfg.server}: {str(e)}")
+            METRICS["up"].labels(server=server_cfg.server).set(0)
 
-    port = get_env_int('PORT', 8000)
-    poll_interval = get_env_int('POLL_INTERVAL', 30)
+    def _process_apps(self, server_url: str, items: List[Dict]):
+        for app in items:
+            meta = app.get('metadata', {})
+            spec = app.get('spec', {})
+            status = app.get('status', {})
+            
+            name = meta.get('name', 'unknown')
+            project = spec.get('project', 'default')
+            namespace = meta.get('namespace', 'unknown')
+            dest = spec.get('destination', {})
+            cluster = dest.get('server') or dest.get('name') or 'unknown'
+            
+            h_stat = status.get('health', {}).get('status', 'Unknown')
+            s_stat = status.get('sync', {}).get('status', 'Unknown')
 
-    logger.info(f"Starting ArgoCD Exporter with {len(config)} servers on port {port}")
+            # Update Metrics
+            METRICS["info"].labels(
+                server=server_url, app_name=name, project=project,
+                health_status=h_stat, sync_status=s_stat,
+                namespace=namespace, cluster=cluster
+            ).set(1)
 
-    # Start Prometheus HTTP server
-    start_http_server(port)
-    
-    while True:
-        await collect_metrics(config)
-        await asyncio.sleep(poll_interval)
+            METRICS["health"].labels(
+                server=server_url, app_name=name, project=project,
+                namespace=namespace, cluster=cluster
+            ).set(1 if h_stat == 'Healthy' else 0)
+
+            METRICS["sync"].labels(
+                server=server_url, app_name=name, project=project,
+                namespace=namespace, cluster=cluster
+            ).set(1 if s_stat == 'Synced' else 0)
+
+    async def run_loop(self):
+        start_http_server(self.config.port)
+        logger.info(f"Exporter listening on port {self.config.port}")
+        
+        while True:
+            for m in METRICS.values(): m.clear()
+            
+            tasks = [self.fetch_and_record(s) for s in self.config.servers]
+            await asyncio.gather(*tasks)
+            
+            await asyncio.sleep(self.config.poll_interval)
+
+async def main():
+    try:
+        raw_config = os.environ.get('ARGOCD_CONFIG', '[]')
+        servers = TypeAdapter(List[ArgoServerConfig]).validate_json(raw_config)
+        
+        config = ExporterConfig(
+            servers=servers,
+            port=int(os.environ.get('PORT', 8000)),
+            poll_interval=int(os.environ.get('POLL_INTERVAL', 30))
+        )
+    except Exception as e:
+        logger.critical(f"Config validation failed: {e}")
+        return
+
+    exporter = ArgoExporter(config)
+    await exporter.run_loop()
 
 if __name__ == '__main__':
     asyncio.run(main())
